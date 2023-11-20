@@ -1,0 +1,168 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: operator-sa
+  namespace: shell-op
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: operator-cr
+rules:
+- apiGroups: [""]
+  resources:
+  - namespaces
+  - services
+  - pods
+  verbs: ["get", "watch", "list"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "watch", "list", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: operator-crb
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: operator-cr
+subjects:
+  - kind: ServiceAccount
+    name: operator-sa
+    namespace: shell-op
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shell-operator
+  namespace: shell-op
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: shell-operator
+  template:
+    metadata:
+      labels:
+        app: shell-operator
+    spec:
+      serviceAccountName: operator-sa
+      containers:
+      - name: shell-operator
+        image: flant/shell-operator:v1.4.3
+        imagePullPolicy: IfNotPresent
+        command:
+          - bash
+          - -c
+          - |
+            cat > /hooks/pod-monitor.sh <<'XXX'
+            #!/bin/bash
+            source /shell_lib.sh
+            function __config__() {
+              cat << EOF
+                configVersion: v1
+                kubernetes:
+                - name: src_pods
+                  apiVersion: v1
+                  kind: Pod
+                  nameSelector:
+                    matchNames:
+                    - backend-0
+                    - backend-1
+                    - backend-2
+                  namespace:
+                    nameSelector:
+                      matchNames: ["shell-op"]
+                  group: main
+                - name: dst_services
+                  apiVersion: v1
+                  kind: Service
+                  labelSelector:
+                    matchLabels:
+                      shell-managed: "yes"
+                  jqFilter: |
+                    {
+                      "name": .metadata.name,
+                      "namespace": .metadata.namespace,
+                      "selector": .spec.selector,
+                      "selectorPod": .spec.selector."statefulset.kubernetes.io/pod-name",
+                      "hasLabel": (.metadata.labels // {} | contains({"shell-managed": "yes"}))
+                    }
+                  group: main
+                  keepFullObjectsInMemory: false
+            EOF
+            }
+            function sync_services() {
+              echo "sync_services($*)"
+              R=$(( $RANDOM % 1000 + 1000 ))
+              T=$(date +%s)
+              A="switched to $2 by $HOSTNAME"
+              kubectl -n shell-op annotate --overwrite svc $1 event-$T-$R="$A"
+              echo "annotated with $A"
+              kubectl -n shell-op patch service $1 \
+                -p '{"spec":{"selector":{"statefulset.kubernetes.io/pod-name":"'$2'"}}}'
+            }
+            function __main__() {
+              # echo "called __main__($*)"
+              # dst_services="$(context::jq -r --indent 0 '.snapshots.dst_services')"
+              # echo "dst_services = $dst_services"
+              #
+              F=`mktemp`
+              context::jq -r '.' > $F
+              echo saved context to $F
+              #
+              PODS_STATUS=$(mktemp)
+              for i in $(seq 0 "$(context::jq -r '(.snapshots.src_pods | length) - 1')"); do
+                pod_name="$(context::jq -r --indent 0 '.snapshots.src_pods['"$i"'].object.metadata.name')"
+                pod_phase="$(context::jq -r --indent 0 '.snapshots.src_pods['"$i"'].object.status.phase')"
+                deletionTimestamp="$(context::jq -r --indent 0 '.snapshots.src_pods['"$i"'].object.metadata.deletionTimestamp')"
+                containerStatuses="$(context::jq -r --indent 0 '.snapshots.src_pods['"$i"'].object.status.containerStatuses')"
+                all_containers_ready="$(context::jq -r --indent 0 '
+                  all(.snapshots.src_pods['"$i"'].object.status.containerStatuses[].ready; . == true)
+                ')"
+                # ^^TODO: there might be no .status.containerStatuses on startup
+                DELETED=""
+                if [ "$deletionTimestamp" != "null" ]; then
+                  DELETED=" (deleted at $deletionTimestamp)"
+                  all_containers_ready=false
+                fi
+                echo "$pod_name:$all_containers_ready" >> $PODS_STATUS
+                echo "pod $i = $pod_name is $pod_phase - allReady is $all_containers_ready$DELETED"
+              done
+              for i in $(seq 0 "$(context::jq -r '(.snapshots.dst_services | length) - 1')"); do
+                svc_name="$(context::jq -r '.snapshots.dst_services['"$i"'].filterResult.name')"
+                if [ "$(context::jq -e '.snapshots.dst_services['"$i"'].filterResult.hasLabel')" == "true" ]; then
+                  svc_selectorPod="$(context::jq -r '.snapshots.dst_services['"$i"'].filterResult.selectorPod')"
+                  if grep "^$svc_selectorPod:" $PODS_STATUS >/dev/null; then
+                    selectorPodStatus=$(cat $PODS_STATUS | grep "^$svc_selectorPod:" | cut -d: -f2)
+                  else
+                    echo "WARNING: pod $svc_selectorPod not found"
+                    selectorPodStatus=unknown
+                  fi
+                  echo "svc $svc_name is on $svc_selectorPod (containersReady = $selectorPodStatus)"
+                  if [ "$selectorPodStatus" != "true" ]; then
+                    echo "looking for ready pod to switch..."
+                    if ! grep :true$ $PODS_STATUS; then
+                      echo "WARNING: no ready pods found, nothing we can do .."
+                      continue
+                    fi
+                    NEXT_READY_POD=$(cat $PODS_STATUS | sort -n | grep :true$ | cut -d: -f1 | head -1)
+                    if [ -n "$NEXT_READY_POD" ]; then
+                      echo "switching $svc_name to $NEXT_READY_POD"
+                      sync_services "$svc_name" "$NEXT_READY_POD"
+                    fi
+                  fi
+                else
+                  echo "$svc_name is not labeled, skipping .."
+                fi
+              done
+              rm -f $PODS_STATUS
+            }
+            hook::run "$@"
+            XXX
+            ###############################################################################
+            chmod +x /hooks/*.sh
+            exec /sbin/tini -- /shell-operator start
+

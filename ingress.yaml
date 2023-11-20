@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    kubernetes.io/tls-acme: "true"
+    nginx.ingress.kubernetes.io/backend-protocol: HTTP
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+  name: shell-op
+  namespace: shell-op
+spec:
+  rules:
+  - host: shell-op.k8s1.XXX.org
+    http:
+      paths:
+      - backend:
+          service:
+            name: operated-backend
+            port:
+              number: 8080
+        pathType: ImplementationSpecific
+  tls:
+  - hosts:
+    - shell-op.k8s1.XXX.org
+    secretName: shell-op-k8s1-XXX-org
+
